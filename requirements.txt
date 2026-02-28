@@ -1,7 +1,7 @@
 streamlit
 yfinance
 pandas
-pandas-ta
+numpy
 requests
 lxml
 anthropic
