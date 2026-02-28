@@ -1,7 +1,7 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
-import pandas_ta as ta
+import numpy as np
 import concurrent.futures
 import requests
 import io
@@ -14,10 +14,10 @@ warnings.filterwarnings('ignore')
 st.set_page_config(page_title="Screener Weinstein + IA", page_icon="📈", layout="wide")
 
 st.title("📈 Screener Avanzado: Método Weinstein")
-st.markdown("Busca señales de compra institucional e integra **Claude IA** para analizar los resultados.")
+st.markdown("Busca señales de compra institucional e integra **Claude IA** para analizar los resultados. *(Lógica matemática exacta a TradingView)*")
 
 # --- FUNCIONES DEL SCREENER ---
-@st.cache_data(ttl=3600) # Guarda en caché la lista por 1 hora para no saturar Wikipedia
+@st.cache_data(ttl=3600)
 def get_tickers(indice):
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36'}
     urls = []
@@ -42,51 +42,75 @@ def get_tickers(indice):
             pass
     return list(set([str(t).replace('.', '-') for t in tickers]))
 
+def get_wma(serie, length):
+    """Recrea la fórmula exacta del WMA de TradingView"""
+    weights = np.arange(1, length + 1)
+    return serie.rolling(length).apply(lambda x: np.dot(x, weights) / weights.sum(), raw=True)
+
 def screener_weinstein(ticker, ticker_ref="^GSPC"):
     try:
+        # Descargas
         df = yf.download(ticker, period="5y", interval="1wk", progress=False)
         spx = yf.download(ticker_ref, period="5y", interval="1wk", progress=False)
+        
+        # Corrección MultiIndex
+        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.droplevel(1)
+        if isinstance(spx.columns, pd.MultiIndex): spx.columns = spx.columns.droplevel(1)
+        
         if df.empty or spx.empty or len(df) < 55: return None
 
-        data = pd.DataFrame({
-            'Close': df['Close'].squeeze(),
-            'Volume': df['Volume'].squeeze(),
-            'SPX_Close': spx['Close'].squeeze()
-        }).dropna()
+        # Alineación milimétrica de fechas
+        df.index = pd.to_datetime(df.index).tz_localize(None)
+        spx.index = pd.to_datetime(spx.index).tz_localize(None)
+        
+        data = pd.DataFrame({'Close': df['Close'], 'Volume': df['Volume']})
+        spx_df = pd.DataFrame({'SPX_Close': spx['Close']})
+        
+        data = pd.merge_asof(data, spx_df, left_index=True, right_index=True, direction='backward')
+        data = data.dropna()
 
-        u_mansf1, distancia_max = -30.0, 15.0
+        if len(data) < 55: return None
 
-        # Cálculos Técnicos
+        u_mansf1 = -30.0
+        distancia_max = 15.0
+
+        # Mansfield RS
         data['rs_line'] = (data['Close'] / data['SPX_Close']) * 100
-        data['rs_ma'] = ta.sma(data['rs_line'], length=52)
+        data['rs_ma'] = data['rs_line'].rolling(52).mean()
         data['mansfield'] = ((data['rs_line'] / data['rs_ma']) - 1) * 100
         data['mansfield_ok1'] = (data['mansfield'] > u_mansf1) & (data['mansfield'] > data['mansfield'].shift(1))
 
-        data['wma10'] = ta.wma(data['Close'], length=10)
-        data['wma20'] = ta.wma(data['Close'], length=20)
-        data['wma30'] = ta.wma(data['Close'], length=30)
-        data['sma30'] = ta.sma(data['Close'], length=30)
+        # Medias
+        data['wma10'] = get_wma(data['Close'], 10)
+        data['wma20'] = get_wma(data['Close'], 20)
+        data['wma30'] = get_wma(data['Close'], 30)
+        data['sma30'] = data['Close'].rolling(30).mean()
 
         data['wma10_up'] = data['wma10'] > data['wma10'].shift(1)
         data['wma20_up'] = data['wma20'] > data['wma20'].shift(1)
         data['sma30_dn'] = data['sma30'] < data['sma30'].shift(1)
 
+        # Precio
         data['distancia'] = ((data['Close'] - data['wma30']) / data['wma30']) * 100
         data['precio_ok'] = (data['Close'] >= data['wma30']) & (data['distancia'] <= distancia_max)
-        
-        crossover_sma30 = (data['Close'] > data['sma30']) & (data['Close'].shift(1) <= data['sma30'].shift(1))
-        data['rompe_sma30'] = crossover_sma30 | (data['Close'] > data['sma30'])
-        data['setup_1'] = (data['precio_ok'] & data['mansfield_ok1'] & data['wma10_up'] & data['wma20_up'] & data['sma30_dn'] & data['rompe_sma30'])
+        data['rompe_sma30'] = data['Close'] > data['sma30']
 
-        data['vol_avg'] = ta.sma(data['Volume'], length=52)
-        data['vol_std'] = ta.stdev(data['Volume'], length=52)
+        data['setup_1'] = (data['precio_ok'] & data['mansfield_ok1'] & 
+                           data['wma10_up'] & data['wma20_up'] & 
+                           data['sma30_dn'] & data['rompe_sma30'])
+
+        # Volumen
+        data['vol_avg'] = data['Volume'].rolling(52).mean()
+        data['vol_std'] = data['Volume'].rolling(52).std(ddof=0) 
         data['vpm'] = (data['Volume'] - data['vol_avg']) / data['vol_std']
-        data['vpm_ok'] = ta.sma(data['vpm'], length=5) > 0
+        data['vpm5'] = data['vpm'].rolling(5).mean()
+        data['vpm_ok'] = data['vpm5'] > 0
 
         data['mansfield_ok2'] = (data['mansfield'] > 0.0) & (data['mansfield'] > data['mansfield'].shift(1))
         data['confirmacion'] = data['vpm_ok'] & data['mansfield_ok2'] & (data['Close'] > data['sma30'])
         data['confirmacion_change'] = (data['confirmacion'] == True) & (data['confirmacion'].shift(1) == False)
 
+        # Memoria 12 Semanas
         senal_final = []
         barras_setup = None
         for i in range(len(data)):
@@ -98,8 +122,7 @@ def screener_weinstein(ticker, ticker_ref="^GSPC"):
             if senal_compra: barras_setup = None
 
         if senal_final[-1]:
-            # Devolvemos datos para mostrarlos bonito en la tabla
-            return {"Ticker": ticker, "Precio Actual": data['Close'].iloc[-1], "Volumen Relativo": data['vpm'].iloc[-1]}
+            return {"Ticker": ticker, "Precio Actual ($)": round(data['Close'].iloc[-1], 2), "Mansfield RS": round(data['mansfield'].iloc[-1], 2)}
         return None
     except Exception:
         return None
@@ -118,7 +141,6 @@ if iniciar:
     progress_bar = st.progress(0)
     resultados = []
     
-    # Análisis en paralelo
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
         future_to_ticker = {executor.submit(screener_weinstein, t): t for t in tickers}
         completados = 0
@@ -130,30 +152,27 @@ if iniciar:
             if resultado:
                 resultados.append(resultado)
                 
-    # --- RESULTADOS Y ANÁLISIS DE CLAUDE ---
+    # --- RESULTADOS Y ANÁLISIS ---
     if resultados:
-        st.success(f"✅ ¡Se encontraron {len(resultados)} acciones con señal de compra!")
+        st.success(f"✅ ¡Se encontraron {len(resultados)} acciones con señal de compra exacta!")
         df_resultados = pd.DataFrame(resultados)
         st.dataframe(df_resultados, use_container_width=True)
         
-        # Integración con Claude
         st.subheader("🤖 Análisis de Claude AI")
         try:
-            # Llama a la API Key guardada en secreto de Streamlit
             client = anthropic.Anthropic(api_key=st.secrets["CLAUDE_API_KEY"])
             tickers_ganadores = ", ".join(df_resultados['Ticker'].tolist())
             
             with st.spinner("Claude está analizando el contexto de estas acciones..."):
                 mensaje = client.messages.create(
-                    model="claude-3-haiku-20240307", # Haiku es súper rápido y económico para esto
+                    model="claude-3-haiku-20240307",
                     max_tokens=500,
                     messages=[
-                        {"role": "user", "content": f"Actúa como un experto de Wall Street. Las siguientes acciones acaban de dar señal de compra técnica a largo plazo: {tickers_ganadores}. Dame un resumen de 2 párrafos indicando a qué sectores pertenecen, si hay alguna narrativa de mercado que las esté impulsando y si ves correlación entre ellas."}
+                        {"role": "user", "content": f"Actúa como un analista cuantitativo. Las acciones {tickers_ganadores} acaban de dar señal de compra según el método de Stan Weinstein (ruptura de WMA30 con volumen y fuerza relativa positiva). Dame un breve resumen de a qué sectores pertenecen y si hay alguna narrativa macroeconómica actual impulsándolas."}
                     ]
                 )
                 st.write(mensaje.content[0].text)
         except Exception as e:
-            st.warning("No se pudo conectar con Claude. Revisa que tu API Key esté configurada en los Secrets de Streamlit.")
-            st.error(e)
+            st.warning("No se pudo conectar con Claude. Recuerda configurar tu 'CLAUDE_API_KEY' en los Secrets de Streamlit.")
     else:
-        st.warning("Ninguna acción dio señal de compra esta semana.")
+        st.warning("Ninguna acción cumplió con los criterios de compra esta semana.")
