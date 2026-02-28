@@ -1,0 +1,7 @@
+streamlit
+yfinance
+pandas
+pandas-ta
+requests
+lxml
+anthropic
